@@ -1,0 +1,93 @@
+on:
+  workflow_call:
+    inputs:
+      azure-primary-region: 
+        type: string
+        required: true
+        description: 'The primary Azure region to deploy to'
+      environment: 
+        type: string
+        required: true
+        description: 'The environment to deploy to'
+      runs-on:
+        type: string
+        required: false
+        description: 'The runner to run on'
+        default: 'ubuntu-latest'
+      state-resource-group-name:
+        type: string
+        required: false
+        description: 'The name of the state resource group'
+        default: 'rg-alz-state'
+      state-subscription-name:
+        type: string
+        required: false
+        description: 'The name of the state subscription'
+        default: 'alz-state'
+      bootstrap-mode:
+        type: boolean
+        required: false
+        description: 'Whether to run in bootstrap mode'
+        default: true
+    secrets:
+      AZURE_CLIENT_ID:
+        description: 'The Azure Client ID'
+      AZURE_TENANT_ID:
+        description: 'The Azure Tenant ID'
+      GH_TOKEN:
+        description: 'The GitHub Token'
+
+permissions:
+      id-token: write
+      contents: read
+
+jobs:
+  run_bootstrap:
+    name: Run Bootstrap
+    if: success() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release'))
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    outputs:
+      alz-state-subscription-id: ${{ steps.bootstrap.outputs.alz-state-subscription-id }}
+      alz-state-storage-account-name: ${{ steps.bootstrap.outputs.alz-state-storage-account-name }}
+      billing-scope-id: ${{ steps.bootstrap.outputs.billing-scope-id }}
+    steps:
+    - uses: actions/checkout@v3
+    - name: Login via Az module
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        allow-no-subscriptions: true
+        enable-AzPSSession: true
+
+    - name: Run Bootstrap Powershell Script
+      uses: azure/powershell@v1
+      id: bootstrap
+      with:
+        inlineScript: |
+          ./BootstrapALZ.ps1 `
+            -BillingScope ${{ vars.BILLING_SCOPE_ID }} `
+            -StorageAccountName ${{vars.STATE_STORAGE_ACCOUNT_NAME }} `
+            -ResourceGroupName ${{ inputs.state-resource-group-name }} `
+            -BootstrapSubscriptionName ${{ inputs.state-subscription-name }} `
+            -Location ${{ inputs.azure-primary-region }} `
+            -Bootstrap $${{ inputs.bootstrap-mode }}
+        azPSVersion: "latest"
+
+  deploy_terraform: 
+    uses: alztestappvia/alz_cicd_templates/.github/workflows/terraform-deploy.yaml@main
+    name: Run Terraform
+    needs: run_bootstrap
+    with:
+      environment: ${{ inputs.environment }}
+      pool: ${{ inputs.runs-on }}
+      terraform-subscription-id: ${{ needs.run_bootstrap.outputs.alz-state-subscription-id }}
+      terraform-backend-subscription-id: ${{ needs.run_bootstrap.outputs.alz-state-subscription-id }}
+      terraform-backend-storage-account-name: ${{ needs.run_bootstrap.outputs.alz-state-storage-account-name }}
+      terraform-backend-filename: bootstrap.tfstate
+      terraform-command-options: '-var use_oidc=true -var primary_location=${{ inputs.azure-primary-region }} -var environment=${{ inputs.environment }} -var billing_scope=${{ needs.run_bootstrap.outputs.billing-scope-id }} -var bootstrap_mode=${{inputs.bootstrap-mode}} -input=false -no-color'
+    secrets:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
